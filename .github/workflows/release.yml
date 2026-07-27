@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.0). Must already exist.'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so release notes can diff against the previous tag
+
+      - name: Resolve tag
+        id: meta
+        shell: powershell
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ github.event.inputs.tag }}' } else { '${{ github.ref_name }}' }
+          if (-not $tag) { throw 'Could not resolve a tag to release' }
+          Write-Host "Releasing $tag"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build
+        shell: powershell
+        run: .\build.ps1
+
+      - name: Verify output
+        shell: powershell
+        run: |
+          if (-not (Test-Path .\VxeBatteryTray.exe)) { throw 'Build produced no executable' }
+          $f = Get-Item .\VxeBatteryTray.exe
+          Write-Host ('Built {0} ({1:N0} bytes)' -f $f.Name, $f.Length)
+          if ($f.Length -lt 4096) { throw 'Executable is suspiciously small' }
+
+      - name: Package
+        shell: powershell
+        run: |
+          $tag = '${{ steps.meta.outputs.tag }}'
+          $zip = "VxeBatteryTray-$tag.zip"
+          Compress-Archive -Path VxeBatteryTray.exe, README.md, PROTOCOL.md, LICENSE -DestinationPath $zip -Force
+          Get-FileHash VxeBatteryTray.exe, $zip -Algorithm SHA256 |
+            ForEach-Object { '{0}  {1}' -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Out-File -FilePath SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+
+      - name: Write release notes
+        shell: powershell
+        run: |
+          $lines = @(
+            '### Install',
+            '',
+            '1. Download `VxeBatteryTray.exe` below (or the `.zip`, which also includes the docs).',
+            '2. Run it. The battery level appears in your notification tray.',
+            '3. Right-click the icon for settings, or to enable **Start with Windows**.',
+            '',
+            'No installer, no drivers, no admin rights, and no vendor software required.',
+            '',
+            '> Windows SmartScreen may warn on first run because the executable is unsigned.',
+            '> Choose **More info -> Run anyway**, or build it yourself with `.\build.ps1`.',
+            '',
+            'Verify your download against `SHA256SUMS.txt`:',
+            '',
+            '```powershell',
+            'Get-FileHash .\VxeBatteryTray.exe -Algorithm SHA256',
+            '```',
+            ''
+          )
+          ($lines -join "`n") | Out-File -FilePath notes.md -Encoding utf8
+
+      - name: Create release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.meta.outputs.tag }}'
+          gh release create $tag `
+            VxeBatteryTray.exe `
+            "VxeBatteryTray-$tag.zip" `
+            SHA256SUMS.txt `
+            --title "VXE Battery Tray $tag" `
+            --notes-file notes.md `
+            --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }

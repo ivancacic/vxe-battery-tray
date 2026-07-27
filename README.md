@@ -1,5 +1,8 @@
 # vxe-battery-tray
 
+[![Build](https://github.com/ivancacic/vxe-battery-tray/actions/workflows/ci.yml/badge.svg)](https://github.com/ivancacic/vxe-battery-tray/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A tiny **Windows system-tray battery monitor** for the **ATK GEAR / VXE R1 SE+** wireless gaming mouse.
 
 It talks to the mouse's wireless receiver directly over raw HID and shows the battery level as a colour-coded number in your notification tray — **no vendor software, no drivers, no installers, and no admin rights required.**
@@ -31,6 +34,16 @@ Windows doesn't surface a battery reading for this mouse, because the receiver p
   - Other VXE models may use a different command byte — see [PROTOCOL.md](PROTOCOL.md).
 - No .NET SDK needed. The in-box .NET Framework 4.x compiler (`csc.exe`, present on every modern Windows) is used to build.
 
+## Download
+
+Grab `VxeBatteryTray.exe` from the [latest release](https://github.com/ivancacic/vxe-battery-tray/releases/latest) and run it — there's no installer.
+
+> Windows SmartScreen may warn on first run because the executable isn't code-signed. Choose **More info → Run anyway**, or build it yourself from source below. Each release ships a `SHA256SUMS.txt` you can check against:
+>
+> ```powershell
+> Get-FileHash .\VxeBatteryTray.exe -Algorithm SHA256
+> ```
+
 ## Build
 
 ```powershell
@@ -38,6 +51,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
 This generates `app.ico` (if missing) and compiles `VxeBatteryTray.exe` into the repo folder. That's it.
+
+Releases are built the same way on a clean Windows runner — see [`.github/workflows`](.github/workflows).
 
 ## Run
 

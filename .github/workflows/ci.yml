@@ -1,0 +1,35 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # build.ps1 uses the in-box .NET Framework compiler, so there is no
+      # SDK to set up. It also regenerates app.ico, which is not committed.
+      - name: Build
+        shell: powershell
+        run: .\build.ps1
+
+      - name: Verify output
+        shell: powershell
+        run: |
+          if (-not (Test-Path .\VxeBatteryTray.exe)) { throw 'Build produced no executable' }
+          $f = Get-Item .\VxeBatteryTray.exe
+          Write-Host ('Built {0} ({1:N0} bytes)' -f $f.Name, $f.Length)
+          if ($f.Length -lt 4096) { throw 'Executable is suspiciously small' }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VxeBatteryTray-${{ github.sha }}
+          path: VxeBatteryTray.exe
+          if-no-files-found: error
