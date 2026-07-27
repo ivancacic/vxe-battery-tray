@@ -39,6 +39,42 @@ namespace VxeBatteryTray
         public string Reason;
     }
 
+    // Hidden top-level window: marshals SystemEvents callbacks onto the UI thread
+    // and receives WM_DEVICECHANGE broadcasts (dongle plugged / unplugged).
+    public class HiddenWindow : Form
+    {
+        const int WM_DEVICECHANGE = 0x0219;
+        const int DBT_DEVNODES_CHANGED = 0x0007;
+        const int DBT_DEVICEARRIVAL = 0x8000;
+        const int DBT_DEVICEREMOVECOMPLETE = 0x8004;
+
+        public event Action DeviceChanged;
+
+        public HiddenWindow()
+        {
+            ShowInTaskbar = false;
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            Location = new Point(-32000, -32000);
+            Size = new Size(1, 1);
+            IntPtr h = Handle; // force handle creation so Invoke works
+            GC.KeepAlive(h);
+        }
+
+        protected override void SetVisibleCore(bool value) { base.SetVisibleCore(false); }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_DEVICECHANGE)
+            {
+                int ev = m.WParam.ToInt32();
+                if (ev == DBT_DEVNODES_CHANGED || ev == DBT_DEVICEARRIVAL || ev == DBT_DEVICEREMOVECOMPLETE)
+                    if (DeviceChanged != null) DeviceChanged();
+            }
+            base.WndProc(ref m);
+        }
+    }
+
     public class TrayApp : IDisposable
     {
         [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr h);
@@ -46,53 +82,146 @@ namespace VxeBatteryTray
         const string RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string APP_NAME = "VxeBatteryTray";
 
+        // Backoff schedule used after a failed read (resume, replug, sleeping mouse).
+        static readonly int[] RETRY_MS = { 1500, 3000, 6000, 10000, 20000, 30000 };
+
         int pollSeconds = 300;   // configurable
         int lowThreshold = 15;   // configurable
 
         NotifyIcon ni;
-        Timer timer;
+        Timer timer;          // regular poll
+        Timer retryTimer;     // recovery backoff
+        Timer debounceTimer;  // coalesces bursts of device-change messages
+        int retryIndex;
+
         ToolStripMenuItem statusItem, startupItem;
         Icon currentIcon;
         bool lowNotified;
+
+        HiddenWindow hidden;
+        Reading lastGood;         // last successful reading, kept across dropouts
+        DateTime lastGoodAt;
+        string lastError;
+        bool isStale;             // showing lastGood because the current read failed
 
         public TrayApp()
         {
             LoadSettings();
 
+            hidden = new HiddenWindow();
+            hidden.DeviceChanged += OnDeviceChanged;
+
             ni = new NotifyIcon();
             ni.Text = "VXE R1 SE+ battery";
             ni.Visible = true;
-            ni.DoubleClick += delegate { Poll(); };
+            ni.DoubleClick += delegate { PollNow(); };
 
             var menu = new ContextMenuStrip();
             statusItem = new ToolStripMenuItem("Reading...");
             statusItem.Enabled = false;
             menu.Items.Add(statusItem);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(new ToolStripMenuItem("Refresh now", null, delegate { Poll(); }));
+            menu.Items.Add(new ToolStripMenuItem("Refresh now", null, delegate { PollNow(); }));
             menu.Items.Add(new ToolStripMenuItem("Settings...", null, delegate { ShowSettings(); }));
             startupItem = new ToolStripMenuItem("Start with Windows", null, delegate { ToggleStartup(); });
             startupItem.Checked = IsStartupEnabled();
             menu.Items.Add(startupItem);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(new ToolStripMenuItem("Exit", null, delegate { ni.Visible = false; Application.Exit(); }));
+            menu.Items.Add(new ToolStripMenuItem("Exit", null, delegate { Shutdown(); }));
             ni.ContextMenuStrip = menu;
 
             timer = new Timer();
             timer.Interval = pollSeconds * 1000;
-            timer.Tick += delegate { Poll(); };
+            timer.Tick += delegate { Poll(false); };
             timer.Start();
 
-            Poll();
+            retryTimer = new Timer();
+            retryTimer.Tick += OnRetryTick;
+
+            debounceTimer = new Timer();
+            debounceTimer.Interval = 1500;
+            debounceTimer.Tick += delegate { debounceTimer.Stop(); ScheduleRecovery(); };
+
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            SystemEvents.SessionSwitch += OnSessionSwitch;
+
+            Poll(false);
         }
 
-        void Poll()
+        // ---------- wake / device-change handling ----------
+
+        // SystemEvents fires on its own thread; bounce onto the UI thread.
+        void OnUi(Action a)
+        {
+            if (hidden != null && hidden.IsHandleCreated && hidden.InvokeRequired) hidden.BeginInvoke(a);
+            else a();
+        }
+
+        void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == PowerModes.Resume)
+                OnUi(delegate { ScheduleRecovery(); });
+        }
+
+        void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
+        {
+            if (e.Reason == SessionSwitchReason.SessionUnlock ||
+                e.Reason == SessionSwitchReason.SessionLogon ||
+                e.Reason == SessionSwitchReason.ConsoleConnect)
+                OnUi(delegate { ScheduleRecovery(); });
+        }
+
+        void OnDeviceChanged()
+        {
+            // Bursts of WM_DEVICECHANGE arrive during enumeration; coalesce them.
+            debounceTimer.Stop();
+            debounceTimer.Start();
+        }
+
+        // Poll now, and if it fails keep retrying on a backoff instead of waiting
+        // for the next regular tick. USB re-enumeration after resume takes seconds.
+        void ScheduleRecovery()
+        {
+            retryTimer.Stop();
+            retryIndex = 0;
+            if (Poll(true)) return;          // already back
+            retryTimer.Interval = RETRY_MS[0];
+            retryTimer.Start();
+        }
+
+        void OnRetryTick(object sender, EventArgs e)
+        {
+            retryTimer.Stop();
+            if (Poll(true)) return;          // recovered
+            retryIndex++;
+            if (retryIndex < RETRY_MS.Length)
+            {
+                retryTimer.Interval = RETRY_MS[retryIndex];
+                retryTimer.Start();
+            }
+            // else: give up quietly; the regular poll keeps trying.
+        }
+
+        void PollNow()
+        {
+            retryTimer.Stop();
+            if (!Poll(false)) ScheduleRecovery();
+        }
+
+        // ---------- polling ----------
+
+        // Returns true if a live reading was obtained.
+        bool Poll(bool quiet)
         {
             Reading r = Read();
-            UpdateIcon(r);
 
             if (r.Found)
             {
+                lastGood = r;
+                lastGoodAt = DateTime.Now;
+                lastError = null;
+                isStale = false;
+
                 statusItem.Text = string.Format("VXE R1 SE+: {0}%  {1}  {2:N2} V",
                     r.Percent, r.Charging ? "charging" : "on battery", r.Volts);
                 ni.Text = Trunc(string.Format("VXE R1 SE+: {0}% {1} {2:N2}V",
@@ -114,15 +243,32 @@ namespace VxeBatteryTray
             }
             else
             {
-                statusItem.Text = r.Reason;
-                ni.Text = Trunc(r.Reason, 63);
+                lastError = r.Reason;
+                isStale = lastGood != null;
+
+                if (isStale)
+                {
+                    string when = lastGoodAt.ToString("HH:mm");
+                    statusItem.Text = string.Format("VXE R1 SE+: {0}% (last read {1}) - {2}",
+                        lastGood.Percent, when, r.Reason);
+                    ni.Text = Trunc(string.Format("VXE R1 SE+: {0}% at {1} (stale) - reconnecting...",
+                        lastGood.Percent, when), 63);
+                }
+                else
+                {
+                    statusItem.Text = r.Reason;
+                    ni.Text = Trunc(r.Reason, 63);
+                }
             }
+
+            UpdateIcon();
+            return r.Found;
         }
 
         static string Trunc(string s, int n) { return s.Length <= n ? s : s.Substring(0, n); }
 
         // ---------- icon rendering (filled pill + bold white number) ----------
-        void UpdateIcon(Reading r)
+        void UpdateIcon()
         {
             using (var bmp = new Bitmap(32, 32))
             using (var g = Graphics.FromImage(bmp))
@@ -133,27 +279,36 @@ namespace VxeBatteryTray
 
                 Color fill;
                 string txt;
-                if (!r.Found)
+                bool charging = false;
+
+                if (lastGood != null && !isStale)
                 {
-                    fill = Color.FromArgb(120, 120, 120);
-                    txt = "?";
+                    fill = lastGood.Percent >= 50 ? Color.FromArgb(46, 160, 67)
+                         : lastGood.Percent >= 20 ? Color.FromArgb(212, 150, 0)
+                         : Color.FromArgb(206, 52, 52);
+                    txt = lastGood.Percent >= 100 ? "100" : lastGood.Percent.ToString();
+                    charging = lastGood.Charging;
+                }
+                else if (lastGood != null)
+                {
+                    // Stale: keep the last known number but desaturate so it's
+                    // visibly "not current" rather than lying about freshness.
+                    fill = Color.FromArgb(105, 110, 118);
+                    txt = lastGood.Percent >= 100 ? "100" : lastGood.Percent.ToString();
                 }
                 else
                 {
-                    fill = r.Percent >= 50 ? Color.FromArgb(46, 160, 67)
-                         : r.Percent >= 20 ? Color.FromArgb(212, 150, 0)
-                         : Color.FromArgb(206, 52, 52);
-                    txt = r.Percent >= 100 ? "100" : r.Percent.ToString();
+                    fill = Color.FromArgb(105, 110, 118);
+                    txt = "?";
                 }
 
                 using (var path = RoundRect(0.5f, 0.5f, 31f, 31f, 11f))
                 using (var b = new SolidBrush(fill))
                     g.FillPath(b, path);
 
-                DrawFitText(g, txt, Color.White);
+                DrawFitText(g, txt, isStale ? Color.FromArgb(225, 225, 225) : Color.White);
 
-                if (r.Found && r.Charging)
-                    DrawBolt(g);
+                if (charging) DrawBolt(g);
 
                 SetIconFromBitmap(bmp);
             }
@@ -273,7 +428,7 @@ namespace VxeBatteryTray
                     timer.Interval = pollSeconds * 1000;
                     SaveSettings();
                     lowNotified = false;
-                    Poll();
+                    PollNow();
                 }
             }
         }
@@ -302,11 +457,22 @@ namespace VxeBatteryTray
             }
         }
 
+        void Shutdown()
+        {
+            ni.Visible = false;
+            Application.Exit();
+        }
+
         public void Dispose()
         {
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            SystemEvents.SessionSwitch -= OnSessionSwitch;
             if (timer != null) timer.Dispose();
+            if (retryTimer != null) retryTimer.Dispose();
+            if (debounceTimer != null) debounceTimer.Dispose();
             if (ni != null) { ni.Visible = false; ni.Dispose(); }
             if (currentIcon != null) currentIcon.Dispose();
+            if (hidden != null) hidden.Dispose();
         }
 
         // ---------- HID battery read ----------

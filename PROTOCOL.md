@@ -93,5 +93,11 @@ other command and re-check which byte holds a sane 0..100 value.
 - Use an **overlapped** read with a timeout (~800 ms) so the call can't hang if
   the mouse is asleep and never replies. Cancel the I/O on timeout.
 - A sleeping mouse may not answer the first poll; a wiggle wakes it. The tray app
-  surfaces this as *"No reply — mouse may be asleep"* rather than showing a stale
-  value.
+  surfaces this as *"No reply — mouse may be asleep"* rather than silently showing
+  a stale value as if it were current.
+- **After system resume the receiver takes several seconds to re-enumerate**, so
+  the first read after waking will usually fail. Don't treat one failure as
+  "device gone": listen for `PowerModeChanged`/`Resume` and `WM_DEVICECHANGE`,
+  then retry on a short backoff (this app uses 1.5s → 3 → 6 → 10 → 20 → 30).
+  Re-resolve the interface path on every attempt — the old path is invalid after
+  re-enumeration.

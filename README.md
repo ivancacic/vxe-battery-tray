@@ -18,6 +18,7 @@ Windows doesn't surface a battery reading for this mouse, because the receiver p
 - **Hover tooltip** — e.g. `VXE R1 SE+: 95% on battery 4.10 V` (includes cell voltage).
 - **Low-battery toast** — a Windows notification when you drop to your threshold while unplugged. Fires once, then re-arms after recovery.
 - **Configurable** — right-click → *Settings…* to set the poll interval and the low-battery threshold. Saved to `%AppData%\VxeBatteryTray\settings.ini`.
+- **Survives sleep** — reconnects automatically after resume, unlock, or replugging the receiver, instead of getting stuck on a stale reading.
 - **Start with Windows** — one-click toggle (a per-user registry `Run` entry).
 - **Light footprint** — ~33 MB RAM, single instance, no background CPU between polls.
 - **Zero dependencies** — a single ~15 KB `.exe` built with the .NET Framework compiler that already ships with Windows.
@@ -72,7 +73,8 @@ No, not measurably. Each poll is a single tiny radio exchange — negligible nex
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| Tray shows a grey **?** | Receiver unplugged or mouse powered off. Hover for the reason. |
+| Tray shows a grey **?** | No reading yet this session — receiver unplugged or mouse powered off. Hover for the reason. |
+| Number goes **grey** | The last known value, shown while the link is down (e.g. just after waking). It retries automatically and returns to colour once it reconnects. |
 | "No reply — mouse may be asleep" | Give the mouse a wiggle and right-click → *Refresh now*. |
 | Wrong / stuck value on a different VXE model | The battery command byte may differ. See [PROTOCOL.md](PROTOCOL.md) and try command `0x17`. |
 | Toast never appears | Check Windows **Focus Assist / Do Not Disturb**; it may route the alert straight to the Action Center. |
